@@ -88,12 +88,13 @@
       const ws = wb.Sheets[wb.SheetNames[0]];
       const rows: any[][] = XLSX.utils.sheet_to_json(ws, { header: 1 });
 
-      const records: any[] = [];
+      // Usar Map para deduplicar por IMEI (evita error 500 en upsert)
+      const recordMap = new Map<string, any>();
       for (const row of rows) {
         if (!row[0] || !row[1]) continue;
         const imei = String(row[1]).replace(/\D/g, "");
         if (imei.length >= 14) {
-          records.push({
+          recordMap.set(imei, {
             modelo: String(row[0]).trim(),
             imei,
             codigo_registro: row[2] ? String(row[2]).trim() : "",
@@ -101,12 +102,16 @@
         }
       }
 
+      const records = Array.from(recordMap.values());
+
       if (!records.length) {
-        uploadErr = "No se encontraron registros válidos.";
+        uploadErr =
+          "No se encontraron registros válidos (mínimo 14 dígitos en columna B).";
         uploading = false;
         return;
       }
 
+      // Crear batch con conteo real de registros únicos
       const { data: batch, error: be } = await supabase
         .from("excel_batches")
         .insert({
@@ -116,23 +121,29 @@
         })
         .select()
         .single();
-      if (be) throw be;
+      if (be) throw new Error(`Error creando lote: ${be.message}`);
 
-      for (let i = 0; i < records.length; i += 500) {
-        const { error: ie } = await supabase.from("imei_records").upsert(
-          records.slice(i, i + 500).map((r) => ({ ...r, batch_id: batch.id })),
-          { onConflict: "imei" },
-        );
-        if (ie) throw ie;
+      // Insertar en chunks de 200 registros
+      for (let i = 0; i < records.length; i += 200) {
+        const chunk = records
+          .slice(i, i + 200)
+          .map((r) => ({ ...r, batch_id: batch.id }));
+        const { error: ie } = await supabase
+          .from("imei_records")
+          .upsert(chunk, { onConflict: "imei" });
+        if (ie)
+          throw new Error(
+            `Error insertando registros (chunk ${Math.floor(i / 200) + 1}): ${ie.message}`,
+          );
       }
 
-      uploadOk = `${records.length} registros cargados de "${uploadFile.name}"`;
+      uploadOk = `✓ ${records.length} registros únicos cargados de "${uploadFile.name}"`;
       uploadFile = null;
       const fi = document.getElementById("file-inp") as HTMLInputElement;
       if (fi) fi.value = "";
       await loadBatches();
     } catch (e: any) {
-      uploadErr = `Error: ${e.message ?? "Ocurrió un problema."}`;
+      uploadErr = e.message ?? "Ocurrió un problema al procesar el archivo.";
     } finally {
       uploading = false;
     }
